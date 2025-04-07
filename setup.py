@@ -14,7 +14,7 @@ setup(
     packages=find_packages(exclude=['contrib', 'docs', 'tests*']),
     python_requires='>=3.7, <4',
     install_requires=[
-        "google-cloud-secret-manager",  # Para inicialización y autenticación en GCP.
+        "google-cloud-secret-manager>=2.7.0",       # Acceso a Secret Manager para autenticación en GCP
         "google-auth>=2.0.0",                # Utilizado en autenticación con GCP.
         "PyPDF2>=3.0.0",                    # Para el manejo y procesamiento de PDFs.
         "pandas>=1.3.0"                     # Para manipulación y análisis de tablas.
