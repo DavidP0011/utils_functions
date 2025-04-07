@@ -1,9 +1,6 @@
 # __________________________________________________________________________________________________________________________________________________________
-# ini_environment_identification
+# _ini_authenticate_API
 # __________________________________________________________________________________________________________________________________________________________
-# ----------------------------------------------------------------------------
-# _ini_authenticate_API()
-# ----------------------------------------------------------------------------
 def _ini_authenticate_API(config: dict, project_id: str):
     """
     Autentica utilizando el diccionario común en config.
@@ -21,7 +18,6 @@ def _ini_authenticate_API(config: dict, project_id: str):
       Credentials: Objeto de credenciales para la autenticación.
     """
     from google.oauth2 import service_account
-
     env = config.get("ini_environment_identificated", "COLAB")
     if env == "LOCAL":
         json_path = config.get("json_keyfile_local")
@@ -34,7 +30,6 @@ def _ini_authenticate_API(config: dict, project_id: str):
             raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_colab' en config para entorno COLAB.")
         credentials = service_account.Credentials.from_service_account_file(json_path)
     else:
-        # Asumimos que para GCP (COLAB_ENTERPRISE o si se pasa un project_id distinto) se usa Secret Manager.
         secret_id = config.get("json_keyfile_GCP_secret_id")
         if not secret_id:
             raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_GCP_secret_id' en config para entornos GCP.")
@@ -53,6 +48,17 @@ def _ini_authenticate_API(config: dict, project_id: str):
 
 
 
+
+
+
+
+
+
+
+
+# __________________________________________________________________________________________________________________________________________________________
+# ini_environment_identification
+# __________________________________________________________________________________________________________________________________________________________
 def ini_environment_identification() -> str:
     """
     Detecta el entorno de ejecución original basado en variables de entorno y módulos disponibles.
