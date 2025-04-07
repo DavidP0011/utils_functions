@@ -16,16 +16,12 @@ setup(
     packages=find_packages(exclude=['contrib', 'docs', 'tests*']),
     python_requires='>=3.7, <4',
     install_requires=[
-        "google-cloud-bigquery>=2.34.0",
-        "google-cloud-secretmanager>=2.7.0",
-        "google-cloud-translate>=3.0.0",
-        "pandas>=1.3.0",
-        "pandas-gbq>=0.14.0",
-        # "googletrans==4.0.0-rc1",
-        "pycountry>=20.7.3",
-        "rapidfuzz>=2.13.6",
-        "phonenumbers>=8.12.39"
+        "google-cloud-secretmanager>=2.7.0",  # Para inicialización y autenticación en GCP.
+        "google-auth>=2.0.0",                # Utilizado en autenticación con GCP.
+        "PyPDF2>=3.0.0",                    # Para el manejo y procesamiento de PDFs.
+        "pandas>=1.3.0"                     # Para manipulación y análisis de tablas.
     ]
+
 
     entry_points={
         # Scripts ejecutables desde la línea de comando
