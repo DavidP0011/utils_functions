@@ -18,9 +18,7 @@ setup(
         "google-auth>=2.0.0",                # Utilizado en autenticación con GCP.
         "PyPDF2>=3.0.0",                    # Para el manejo y procesamiento de PDFs.
         "pandas>=1.3.0"                     # Para manipulación y análisis de tablas.
-    ]
-
-
+    ],
     entry_points={
         # Scripts ejecutables desde la línea de comando
         # 'console_scripts': [
