@@ -12,58 +12,68 @@ import os
 import io
 import json
 
+
+
 # ----------------------------------------------------------------------------
-# _ini_authenticate_API()
+# fields_name_format()
 # ----------------------------------------------------------------------------
-def _ini_authenticate_API(config: dict, project_id: str):
+def fields_name_format(config):
     """
-    Autentica utilizando el diccionario común en config.
+    Formatea nombres de campos de datos según configuraciones específicas.
     
-    Dependiendo de 'ini_environment_identificated' se utiliza:
-      - "LOCAL": usa la key "json_keyfile_local"
-      - "COLAB": usa la key "json_keyfile_colab"
-      - Para GCP (por ejemplo, "COLAB_ENTERPRISE" o un project_id): usa "json_keyfile_GCP_secret_id"
-      
-    Args:
-      config (dict): Diccionario de configuración.
-      project_id (str): ID del proyecto GCP (se usa en la autenticación GCP).
-      
-    Returns:
-      Credentials: Objeto de credenciales para la autenticación.
+    Parámetros en config:
+      - fields_name_raw_list (list): Lista de nombres de campos.
+      - formato_final (str, opcional): 'CamelCase', 'snake_case', 'Sentence case', o None.
+      - reemplazos (dict, opcional): Diccionario de términos a reemplazar.
+      - siglas (list, opcional): Lista de siglas que deben mantenerse en mayúsculas.
+    
+    Retorna:
+        pd.DataFrame: DataFrame con columnas 'Campo Original' y 'Campo Formateado'.
     """
-    from google.oauth2 import service_account
+    print("[START 🚀] Iniciando formateo de nombres de campos...", flush=True)
+    
+    def aplicar_reemplazos(field, reemplazos):
+        for key, value in sorted(reemplazos.items(), key=lambda x: -len(x[0])):
+            if key in field:
+                field = field.replace(key, value)
+        return field
 
-    env = config.get("ini_environment_identificated", "COLAB")
-    if env == "LOCAL":
-        json_path = config.get("json_keyfile_local")
-        if not json_path:
-            raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_local' en config para entorno LOCAL.")
-        credentials = service_account.Credentials.from_service_account_file(json_path)
-    elif env == "COLAB":
-        json_path = config.get("json_keyfile_colab")
-        if not json_path:
-            raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_colab' en config para entorno COLAB.")
-        credentials = service_account.Credentials.from_service_account_file(json_path)
-    else:
-        # Asumimos que para GCP (COLAB_ENTERPRISE o si se pasa un project_id distinto) se usa Secret Manager.
-        secret_id = config.get("json_keyfile_GCP_secret_id")
-        if not secret_id:
-            raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_GCP_secret_id' en config para entornos GCP.")
-        from google.cloud import secretmanager
-        client_sm = secretmanager.SecretManagerServiceClient()
-        secret_name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
-        response = client_sm.access_secret_version(name=secret_name)
-        secret_str = response.payload.data.decode("UTF-8")
-        import json
-        secret_info = json.loads(secret_str)
-        credentials = service_account.Credentials.from_service_account_info(secret_info)
-    return credentials
-
-
-
-
-
-
+    def formatear_campo(field, formato, siglas):
+        if formato is None or formato is False:
+            return field
+        words = [w for w in re.split(r'[_\-\s]+', field) if w]
+        if formato == 'CamelCase':
+            return ''.join(
+                word.upper() if word.upper() in siglas
+                else word.capitalize() if idx == 0
+                else word.lower()
+                for idx, word in enumerate(words)
+            )
+        elif formato == 'snake_case':
+            return '_'.join(
+                word.upper() if word.upper() in siglas
+                else word.lower() for word in words
+            )
+        elif formato == 'Sentence case':
+            return ' '.join(
+                word.upper() if word.upper() in siglas
+                else word.capitalize() if idx == 0
+                else word.lower()
+                for idx, word in enumerate(words)
+            )
+        else:
+            raise ValueError(f"Formato '{formato}' no soportado.")
+    
+    resultado = []
+    for field in config.get('fields_name_raw_list', []):
+        original_field = field
+        field = aplicar_reemplazos(field, config.get('reemplazos', {}))
+        formatted_field = formatear_campo(field, config.get('formato_final', 'CamelCase'), [sig.upper() for sig in config.get('siglas', [])])
+        resultado.append({'Campo Original': original_field, 'Campo Formateado': formatted_field})
+    
+    df_result = pd.DataFrame(resultado)
+    print("[END [FINISHED 🏁]] Formateo de nombres completado.\n", flush=True)
+    return df_result
 
 
 
