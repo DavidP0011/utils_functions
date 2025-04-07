@@ -1,10 +1,8 @@
 from setuptools import setup, find_packages
 import pathlib
 
-# Directorio actual del archivo setup.py
-here = pathlib.Path(__file__).parent.resolve()
 
-# Si tienes un README (por ejemplo, README.md) en la raíz, lo usamos como long_description
+here = pathlib.Path(__file__).parent.resolve()
 long_description = (here / "README.md").read_text(encoding="utf-8") if (here / "README.md").exists() else ""
 
 setup(
