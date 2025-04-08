@@ -1,4 +1,4 @@
-# dpm_utils_functions/__init__.py
+# dpm_common_functions/__init__.py
 
 # Reexporta la función de autenticación
 from .dpm_GCP_ini_utils import _ini_authenticate_API
