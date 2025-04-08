@@ -1,8 +1,6 @@
-!pip install PyPDF2
-
-from PyPDF2 import PdfReader, PdfWriter
-
 def intercalar_pdfs(impares_path, pares_path, output_path):
+    from PyPDF2 import PdfReader, PdfWriter
+    
     # Cargar los PDFs
     reader_impares = PdfReader(impares_path)
     reader_pares = PdfReader(pares_path)
