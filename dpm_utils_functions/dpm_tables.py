@@ -5,7 +5,7 @@ from google.cloud import bigquery
 import pandas as pd
 import pandas_gbq
 
-from .dpm_GCP_ini_utils import _ini_authenticate_API
+from dpm_common_functions import _ini_authenticate_API
 
 import unicodedata
 import re
