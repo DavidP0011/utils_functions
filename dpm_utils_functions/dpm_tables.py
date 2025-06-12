@@ -521,12 +521,30 @@ def table_DF_to_various_targets(params: dict) -> None:
         creds   = _ini_authenticate_API(params, project).with_scopes(scopes)
         service = build('sheets', 'v4', credentials=creds)
 
-        # Conversión celda a celda SIN applymap (evita FutureWarning)
-        def _cast(v):
-            if pd.isna(v): return None
-            if isinstance(v, (int, np.integer)):   return int(v)
-            if isinstance(v, (float, np.floating)): return int(v) if float(v).is_integer() else float(v)
-            return str(v)
+        # ── Conversión de cada celda ───────────────────────────────────────────────
+        from decimal import Decimal, InvalidOperation
+        
+        def _cast(value):
+            """
+            Devuelve un número nativo (int o float) o una cadena, sin forzar la
+            conversión de floats “enteros” a int para que 25.0 siga siendo 25.0.
+            """
+            if pd.isna(value):
+                return None
+        
+            # Decimals y floats → float preservando los decimales
+            if isinstance(value, (float, np.floating, Decimal)):
+                try:
+                    return float(value)        # 25.0 => 25.0  |  29.97 => 29.97
+                except (ValueError, InvalidOperation):
+                    return str(value)
+        
+            # Ints se mantienen como ints
+            if isinstance(value, (int, np.integer)):
+                return int(value)
+        
+            return str(value)
+
 
         rows = [[_cast(val) for val in row] for row in d.itertuples(index=False, name=None)]
         values = ([d.columns.tolist()] + rows) if mode == "overwrite" else rows
@@ -651,3 +669,4 @@ def table_DF_to_various_targets(params: dict) -> None:
         raise
 
     print("\n🔹🔹🔹 [END [FINISHED ✅]] Escritura completada exitosamente. 🔹🔹🔹\n", flush=True)
+
