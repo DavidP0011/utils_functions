@@ -676,4 +676,3 @@ def table_DF_to_various_targets(params: dict) -> None:
         raise
 
     print("\n🔹🔹🔹 [END [FINISHED ✅]] Escritura completada exitosamente. 🔹🔹🔹\n", flush=True)
-
