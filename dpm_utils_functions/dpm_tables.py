@@ -86,6 +86,343 @@ def fields_name_format(config):
 
 
 # ----------------------------------------------------------------------------
+# tables_consolidate_duplicates_df()
+# ----------------------------------------------------------------------------
+def tables_consolidate_duplicates_df(config_dic: dict):
+    """Consolida dos ``pandas.DataFrame`` resolviendo duplicados.
+
+    La función aplica la política indicada en *config_dic* y devuelve un
+    ``pd.DataFrame`` limpio (y metadatos opcionales) siguiendo el Manual de
+    Estilo DPM.
+
+    Args:
+        config_dic (dict):
+            validate_df_schemas_match (bool, opcional): Valida coincidencia de
+                columnas entre DataFrames (default ``True``).
+            df_initial (pd.DataFrame): DataFrame fuente prioritario.
+            df_to_merge (pd.DataFrame): DataFrame a fusionar.
+            id_fields (list[str]): Campos clave para identificar registros.
+            duplicate_policy (str): ``keep_newest`` | ``keep_oldest`` |
+                ``keep_df_initial`` | ``keep_df_to_merge``.
+            duplicate_date_field (str, opcional): Campo fecha para políticas
+                basadas en tiempo.
+            duplicate_date_field_format_str (str, opcional): Formato
+                ``datetime.strptime`` de *duplicate_date_field*.
+            return_metadata (bool, opcional): Si ``True`` devuelve metadatos.
+
+    Returns:
+        pd.DataFrame | tuple[pd.DataFrame, dict]: DataFrame consolidado y,
+        opcionalmente, metadatos del proceso.
+
+    Raises:
+        ValueError: Parámetros erróneos o esquemas distintos.
+        TypeError: *df_initial* o *df_to_merge* no son ``pd.DataFrame``.
+    """
+
+    # ──────────────────────────
+    # Imports locales mínimos
+    # ──────────────────────────
+    import pandas as pd  # type: ignore
+    from datetime import datetime
+
+    # ──────────────────────────
+    # 1️⃣ Extracción y validación de parámetros
+    # ──────────────────────────
+    allowed_policies_set = {
+        "keep_newest",
+        "keep_oldest",
+        "keep_df_initial",
+        "keep_df_to_merge",
+    }
+
+    validate_schema_bool: bool = config_dic.get("validate_df_schemas_match", True)
+    df_initial_df = config_dic.get("df_initial")
+    df_to_merge_df = config_dic.get("df_to_merge")
+    id_fields_list: list[str] = config_dic.get("id_fields", [])
+    policy_str: str = config_dic.get("duplicate_policy", "keep_newest")
+    date_col_str: str | None = config_dic.get("duplicate_date_field")
+    date_fmt_str: str | None = config_dic.get("duplicate_date_field_format_str")
+    return_meta_bool: bool = config_dic.get("return_metadata", False)
+
+    print(f"[CONSOLIDATION START ▶️] {datetime.now().isoformat(timespec='seconds')}", flush=True)
+    print(
+        f"INFO ℹ️ id_fields={id_fields_list} | policy={policy_str}", flush=True
+    )
+
+    # Validaciones básicas
+    if policy_str not in allowed_policies_set:
+        raise ValueError(f"duplicate_policy debe ser uno de {allowed_policies_set}")
+
+    if not isinstance(df_initial_df, pd.DataFrame) or not isinstance(
+        df_to_merge_df, pd.DataFrame
+    ):
+        raise TypeError("df_initial y df_to_merge deben ser DataFrame")
+
+    if not id_fields_list:
+        raise ValueError("id_fields no puede ser vacío")
+
+    for col_str in id_fields_list:
+        if col_str not in df_initial_df.columns or col_str not in df_to_merge_df.columns:
+            raise ValueError(
+                f"Columna clave '{col_str}' ausente en alguno de los DataFrames"
+            )
+
+    if policy_str in ("keep_newest", "keep_oldest"):
+        if not date_col_str:
+            raise ValueError(
+                "duplicate_date_field es obligatorio para la política basada en fecha"
+            )
+        if (
+            date_col_str not in df_initial_df.columns
+            or date_col_str not in df_to_merge_df.columns
+        ):
+            raise ValueError(f"Campo fecha '{date_col_str}' inexistente en ambos DataFrames")
+
+    # ──────────────────────────
+    # 2️⃣ Validación opcional de esquemas
+    # ──────────────────────────
+    if validate_schema_bool and set(df_initial_df.columns) != set(df_to_merge_df.columns):
+        diff_left_set = set(df_initial_df.columns) - set(df_to_merge_df.columns)
+        diff_right_set = set(df_to_merge_df.columns) - set(df_initial_df.columns)
+        print(
+            f"[VALIDATION [ERROR ❌]] Schemas difieren – izquierda: {diff_left_set} | derecha: {diff_right_set}",
+            flush=True,
+        )
+        raise ValueError("Esquemas distintos entre DataFrames")
+
+    # ──────────────────────────
+    # 3️⃣ Concatenar y resolver duplicados
+    #     • keep_newest / keep_oldest  → usa fecha
+    #     • keep_df_initial / keep_df_to_merge → orden de concat
+    # ──────────────────────────
+    df_all_df = pd.concat([df_initial_df, df_to_merge_df], ignore_index=True)
+    duplicates_before_int: int = len(df_all_df)
+
+    # Helper para convertir fecha
+    def _parse_date_dt(series, fmt):
+        return pd.to_datetime(series, format=fmt, errors="coerce")
+
+    if policy_str in ("keep_newest", "keep_oldest"):
+        df_all_df[date_col_str] = _parse_date_dt(df_all_df[date_col_str], date_fmt_str)
+
+        # Rellena NaT para que idxmax/min tomen decisiones coherentes
+        if policy_str == "keep_newest":
+            df_all_df["_temp_sort"] = df_all_df[date_col_str].fillna(pd.Timestamp.min)
+            idx = (
+                df_all_df.groupby(id_fields_list, sort=False)["_temp_sort"].idxmax()
+            )
+        else:  # keep_oldest
+            df_all_df["_temp_sort"] = df_all_df[date_col_str].fillna(pd.Timestamp.max)
+            idx = (
+                df_all_df.groupby(id_fields_list, sort=False)["_temp_sort"].idxmin()
+            )
+
+        result_df = df_all_df.loc[idx].copy()
+        result_df = result_df.drop(columns=["_temp_sort"])  # limpia helper
+    else:
+        # Mantener orden de concatenación; "first" preserva df_initial_df
+        keep_flag = "first" if policy_str == "keep_df_initial" else "last"
+        result_df = (
+            df_all_df.drop_duplicates(subset=id_fields_list, keep=keep_flag)
+            .copy()
+        )
+
+    result_df.reset_index(drop=True, inplace=True)
+
+    # ──────────────────────────
+    # 4️⃣ Alinear dtypes al esquema original
+    # ──────────────────────────
+    for col_str, dtype in df_initial_df.dtypes.items():
+        try:
+            result_df[col_str] = result_df[col_str].astype(dtype, copy=False)
+        except (ValueError, TypeError):
+            print(
+                f"[TYPE WARN ⚠️] No se pudo convertir '{col_str}' a {dtype}", flush=True
+            )
+
+    # ──────────────────────────
+    # 5️⃣ Metadatos y salida
+    # ──────────────────────────
+    duplicates_resolved_int = duplicates_before_int - len(result_df)
+    print(
+        f"FINISHED ✅ registros finales={len(result_df)} | duplicados_resueltos={duplicates_resolved_int}",
+        flush=True,
+    )
+
+    if return_meta_bool:
+        metadata_dic: dict = {
+            "timestamp": datetime.now(),
+            "initial_records": len(df_initial_df),
+            "merge_records": len(df_to_merge_df),
+            "final_records": len(result_df),
+            "duplicates_resolved": duplicates_resolved_int,
+            "records_added": len(result_df) - len(df_initial_df),
+        }
+        return result_df, metadata_dic
+
+    return result_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ----------------------------------------------------------------------------
+# DType_df_to_df()
+# ----------------------------------------------------------------------------
+def DType_df_to_df(config: Dict[str, Any]):
+    """Copia *dtypes* entre DataFrames con coerción robusta.
+
+    Claves flexibles admitidas en el `config`:
+    - ``reference_dtype_df`` / ``source_df`` → DataFrame cuya *signature* de `dtypes` actúa de referencia.
+    - ``target_dtype_df`` / ``targete_dtype_df`` / ``target_df`` → DataFrame al que se le aplicarán los dtypes.
+
+    Parámetros opcionales:
+    ---------------------
+    inplace : bool  (default ``True``)
+        Si *True*, muta el ``target`` *in‑place*; si *False* trabaja con una copia.
+    return_metadata : bool  (default ``True``)
+        Devuelve un segundo objeto con información de columnas casteadas / fallidas / omitidas.
+    decimal_comma : bool  (default ``True``)
+        Pre‑procesa strings reemplazando `"," → "."` antes de la coerción numérica.
+
+    Returns
+    -------
+    pd.DataFrame | Tuple[pd.DataFrame, dict]
+        El DataFrame transformado y, opcionalmente, un diccionario con metadatos.
+    """
+    import pandas as pd
+    import numpy as np
+    from typing import Dict, Any, List, Tuple
+
+    # --------------------- VALIDACIÓN DE ENTRADA ---------------------
+    source_df = config.get("reference_dtype_df", config.get("source_df"))
+    target_df = config.get("target_dtype_df", config.get("targete_dtype_df", config.get("target_df")))
+
+    if source_df is None or target_df is None:
+        raise ValueError("[VALIDATION ❌] Debes proporcionar 'reference_dtype_df/source_df' y 'target_dtype_df/target_df'.")
+    if not isinstance(source_df, pd.DataFrame):
+        raise ValueError("[VALIDATION ❌] 'reference_dtype_df' no es DataFrame.")
+    if not isinstance(target_df, pd.DataFrame):
+        raise ValueError("[VALIDATION ❌] 'target_dtype_df' no es DataFrame.")
+
+    inplace: bool = config.get("inplace", True)
+    return_metadata: bool = config.get("return_metadata", True)
+    decimal_comma: bool = config.get("decimal_comma", True)
+
+    if not inplace:
+        target_df = target_df.copy()
+
+    print("🔹🔹🔹 [START ▶️] DTYPE COPY", flush=True)
+
+    # ------------------------ LÓGICA PRINCIPAL ------------------------
+    common_cols: List[str] = [c for c in source_df.columns if c in target_df.columns]
+    if not common_cols:
+        print("[DTYPE COPY ⚠️] No hay columnas coincidentes.", flush=True)
+        empty_meta = {"cols_casted": [], "cols_failed": [], "cols_skipped": []}
+        return (target_df, empty_meta) if return_metadata else target_df
+
+    cols_casted, cols_failed, cols_skipped = [], [], []
+
+    def _safe_cast(col: pd.Series, tgt_dtype) -> Tuple[pd.Series, bool]:
+        """Intenta castear la *Series* a `tgt_dtype`.
+
+        Estrategia:
+        1. Intento directo ``astype``.
+        2. Si falla y `tgt_dtype` es numérico → ``pd.to_numeric`` con coerción, gestionando
+           *nullable integer* cuando hay *NaN*.
+        3. Si falla y es fecha → ``pd.to_datetime``.
+        4. *Fallback* → string; marca la conversión como fallida.
+        """
+        # ── Paso 0: pre‑procesar comas decimales ────────────────────
+        series_proc = col.astype(str).str.replace(",", ".", regex=False) if decimal_comma else col
+
+        # ── Paso 1: intento directo ─────────────────────────────────
+        try:
+            return col.astype(tgt_dtype), True
+        except Exception:
+            pass  # continuará con coerciones especializadas
+
+        # ── Paso 2: coerción numérica ───────────────────────────────
+        if pd.api.types.is_numeric_dtype(tgt_dtype):
+            coerced = pd.to_numeric(series_proc, errors="coerce")
+            if pd.api.types.is_integer_dtype(tgt_dtype):
+                # Si existen NaN y el dtype destino es entero ⇒ usar Int64 (nullable)
+                if coerced.isna().any():
+                    return coerced.astype("Int64"), not coerced.isna().all()
+                # sin NaNs: redondea y castea al entero exacto
+                return coerced.round().astype(tgt_dtype), True
+            # destino float
+            return coerced.astype("float64"), not coerced.isna().all()
+
+        # ── Paso 3: coerción de fechas ───────────────────────────────
+        try:
+            if np.issubdtype(tgt_dtype, np.datetime64):
+                coerced_dt = pd.to_datetime(series_proc, errors="coerce")
+                return coerced_dt, not coerced_dt.isna().all()
+        except Exception:
+            pass
+
+        # ── Paso 4: fallback a string ───────────────────────────────
+        return series_proc.astype(str), False
+
+    total = len(common_cols)
+    for idx, col in enumerate(common_cols, start=1):
+        tgt_dtype = source_df[col].dtype
+        if target_df[col].dtype == tgt_dtype:
+            print(f"[DTYPE COPY ℹ️] ({idx}/{total}) '{col}' ya es {tgt_dtype}. Skipped.", flush=True)
+            cols_skipped.append(col)
+            continue
+
+        target_df[col], ok = _safe_cast(target_df[col], tgt_dtype)
+        if ok:
+            print(f"[DTYPE COPY ✅] ({idx}/{total}) '{col}' → {target_df[col].dtype}.", flush=True)
+            cols_casted.append(col)
+        else:
+            print(f"[DTYPE COPY ⚠️] ({idx}/{total}) No se pudo castear '{col}' → {tgt_dtype}.", flush=True)
+            cols_failed.append(col)
+
+    print(
+        f"[DTYPE COPY ✔️] Cast fin — ok: {len(cols_casted)}/{total} | "
+        f"fail: {len(cols_failed)} | skipped: {len(cols_skipped)}",
+        flush=True,
+    )
+
+    meta = {
+        "cols_casted": cols_casted,
+        "cols_failed": cols_failed,
+        "cols_skipped": cols_skipped,
+    }
+
+    return (target_df, meta) if return_metadata else target_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ----------------------------------------------------------------------------
 # table_various_sources_to_DF()
 # ----------------------------------------------------------------------------
 def table_various_sources_to_DF(params: dict) -> pd.DataFrame:
