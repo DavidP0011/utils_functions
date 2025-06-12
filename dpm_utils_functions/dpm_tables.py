@@ -409,9 +409,6 @@ def table_various_sources_to_DF(params: dict) -> pd.DataFrame:
 
 
 
-# ----------------------------------------------------------------------------
-# table_DF_to_various_targets()
-# ----------------------------------------------------------------------------
 def table_DF_to_various_targets(params: dict) -> None:
     """
     Escribe un DataFrame en distintos destinos (archivo local, Google Sheets,
@@ -501,6 +498,10 @@ def table_DF_to_various_targets(params: dict) -> None:
             raise RuntimeError(f"[LOAD [ERROR ❌]] Error al escribir en archivo local: {e}")
 
     def _escribir_google_sheet(p: dict, d: pd.DataFrame) -> None:
+        """
+        Envía el DataFrame a Google Sheets respetando los formatos de fecha-hora
+        españoles (coma decimal). Se sobrescribe o añade según `mode`.
+        """
         import re
         from googleapiclient.discovery import build
         print("\n[LOAD [START ▶️]] Iniciando escritura en Google Sheets…", flush=True)
@@ -511,6 +512,7 @@ def table_DF_to_various_targets(params: dict) -> None:
         if not raw_id or not ws_name:
             raise ValueError("[VALIDATION [ERROR ❌]] Faltan 'spreadsheet_target_table_id' o 'spreadsheet_target_table_worksheet_name'.")
 
+        # Normalizar el ID (por si viene una URL completa)
         m = re.search(r"/d/([A-Za-z0-9-_]+)", raw_id)
         sheet_id = m.group(1) if m else raw_id
 
@@ -521,34 +523,39 @@ def table_DF_to_various_targets(params: dict) -> None:
         creds   = _ini_authenticate_API(params, project).with_scopes(scopes)
         service = build('sheets', 'v4', credentials=creds)
 
-        # ── Conversión de cada celda ───────────────────────────────────────────────
+        # ── NUEVO: convertir columnas datetime a texto con coma decimal ──────────
+        datetime_cols = d.select_dtypes(include=["datetime64[ns]", "datetime64[ns, utc]"]).columns
+        if len(datetime_cols) > 0:
+            d = d.copy()  # evitamos SettingWithCopyWarning
+            for col in datetime_cols:
+                # Ej.: 2021-02-09 08:52:29,217577  (coma decimal)
+                d[col] = d[col].dt.strftime("%Y-%m-%d %H:%M:%S,%f")
+        # ─────────────────────────────────────────────────────────────────────────
+
+        # ── Conversión de cada celda ────────────────────────────────────────────
         from decimal import Decimal, InvalidOperation
-        
         def _cast(value):
             """
-            Devuelve un número nativo (int o float) o una cadena, sin forzar la
-            conversión de floats “enteros” a int para que 25.0 siga siendo 25.0.
+            Devuelve un número nativo, None o str.
+            - Timestamps ya vienen formateados como str con coma.
+            - Si prefieres coma decimal en todos los floats, cambia aquí `float(value)`
+              por `str(value).replace('.', ',')`.
             """
             if pd.isna(value):
                 return None
-        
-            # Decimals y floats → float preservando los decimales
             if isinstance(value, (float, np.floating, Decimal)):
                 try:
-                    return float(value)        # 25.0 => 25.0  |  29.97 => 29.97
+                    return float(value)
                 except (ValueError, InvalidOperation):
                     return str(value)
-        
-            # Ints se mantienen como ints
             if isinstance(value, (int, np.integer)):
                 return int(value)
-        
             return str(value)
-
 
         rows = [[_cast(val) for val in row] for row in d.itertuples(index=False, name=None)]
         values = ([d.columns.tolist()] + rows) if mode == "overwrite" else rows
 
+        # Limpiar rango si es overwrite
         if mode == "overwrite":
             service.spreadsheets().values().clear(
                 spreadsheetId=sheet_id,
