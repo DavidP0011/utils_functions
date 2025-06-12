@@ -1,3 +1,6 @@
+from typing import Dict
+
+
 # @title pdf_merge_intercalated_pages_file()
 def pdf_merge_intercalated_pages_file(config: dict) -> None:
     """
