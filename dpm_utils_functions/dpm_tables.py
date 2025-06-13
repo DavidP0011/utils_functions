@@ -92,9 +92,9 @@ def fields_name_format(config):
 def tables_consolidate_duplicates_df(config_dic: dict):
     """Consolida dos ``pandas.DataFrame`` resolviendo duplicados.
 
-    La función aplica la política indicada en *config_dic* y devuelve un
-    ``pd.DataFrame`` limpio (y metadatos opcionales) siguiendo el Manual de
-    Estilo DPM.
+    La función primero limpia duplicados internos en cada DataFrame, luego
+    aplica la política indicada en *config_dic* y devuelve un ``pd.DataFrame``
+    limpio (y metadatos opcionales) siguiendo el Manual de Estilo DPM.
 
     Args:
         config_dic (dict):
@@ -124,6 +124,7 @@ def tables_consolidate_duplicates_df(config_dic: dict):
     # Imports locales mínimos
     # ──────────────────────────
     import pandas as pd  # type: ignore
+    import numpy as np
     from datetime import datetime
 
     # ──────────────────────────
@@ -146,17 +147,13 @@ def tables_consolidate_duplicates_df(config_dic: dict):
     return_meta_bool: bool = config_dic.get("return_metadata", False)
 
     print(f"[CONSOLIDATION START ▶️] {datetime.now().isoformat(timespec='seconds')}", flush=True)
-    print(
-        f"INFO ℹ️ id_fields={id_fields_list} | policy={policy_str}", flush=True
-    )
+    print(f"INFO ℹ️ id_fields={id_fields_list} | policy={policy_str}", flush=True)
 
     # Validaciones básicas
     if policy_str not in allowed_policies_set:
         raise ValueError(f"duplicate_policy debe ser uno de {allowed_policies_set}")
 
-    if not isinstance(df_initial_df, pd.DataFrame) or not isinstance(
-        df_to_merge_df, pd.DataFrame
-    ):
+    if not isinstance(df_initial_df, pd.DataFrame) or not isinstance(df_to_merge_df, pd.DataFrame):
         raise TypeError("df_initial y df_to_merge deben ser DataFrame")
 
     if not id_fields_list:
@@ -164,19 +161,12 @@ def tables_consolidate_duplicates_df(config_dic: dict):
 
     for col_str in id_fields_list:
         if col_str not in df_initial_df.columns or col_str not in df_to_merge_df.columns:
-            raise ValueError(
-                f"Columna clave '{col_str}' ausente en alguno de los DataFrames"
-            )
+            raise ValueError(f"Columna clave '{col_str}' ausente en alguno de los DataFrames")
 
     if policy_str in ("keep_newest", "keep_oldest"):
         if not date_col_str:
-            raise ValueError(
-                "duplicate_date_field es obligatorio para la política basada en fecha"
-            )
-        if (
-            date_col_str not in df_initial_df.columns
-            or date_col_str not in df_to_merge_df.columns
-        ):
+            raise ValueError("duplicate_date_field es obligatorio para la política basada en fecha")
+        if (date_col_str not in df_initial_df.columns or date_col_str not in df_to_merge_df.columns):
             raise ValueError(f"Campo fecha '{date_col_str}' inexistente en ambos DataFrames")
 
     # ──────────────────────────
@@ -185,83 +175,250 @@ def tables_consolidate_duplicates_df(config_dic: dict):
     if validate_schema_bool and set(df_initial_df.columns) != set(df_to_merge_df.columns):
         diff_left_set = set(df_initial_df.columns) - set(df_to_merge_df.columns)
         diff_right_set = set(df_to_merge_df.columns) - set(df_initial_df.columns)
-        print(
-            f"[VALIDATION [ERROR ❌]] Schemas difieren – izquierda: {diff_left_set} | derecha: {diff_right_set}",
-            flush=True,
-        )
+        print(f"[VALIDATION ERROR ❌] Schemas difieren – izquierda: {diff_left_set} | derecha: {diff_right_set}", flush=True)
         raise ValueError("Esquemas distintos entre DataFrames")
 
     # ──────────────────────────
-    # 3️⃣ Concatenar y resolver duplicados
-    #     • keep_newest / keep_oldest  → usa fecha
-    #     • keep_df_initial / keep_df_to_merge → orden de concat
+    # 3️⃣ PASO CRÍTICO: Limpiar duplicados internos primero
     # ──────────────────────────
-    df_all_df = pd.concat([df_initial_df, df_to_merge_df], ignore_index=True)
-    duplicates_before_int: int = len(df_all_df)
-
-    # Helper para convertir fecha
-    def _parse_date_dt(series, fmt):
-        return pd.to_datetime(series, format=fmt, errors="coerce")
-
-    if policy_str in ("keep_newest", "keep_oldest"):
-        df_all_df[date_col_str] = _parse_date_dt(df_all_df[date_col_str], date_fmt_str)
-
-        # Rellena NaT para que idxmax/min tomen decisiones coherentes
-        if policy_str == "keep_newest":
-            df_all_df["_temp_sort"] = df_all_df[date_col_str].fillna(pd.Timestamp.min)
-            idx = (
-                df_all_df.groupby(id_fields_list, sort=False)["_temp_sort"].idxmax()
-            )
-        else:  # keep_oldest
-            df_all_df["_temp_sort"] = df_all_df[date_col_str].fillna(pd.Timestamp.max)
-            idx = (
-                df_all_df.groupby(id_fields_list, sort=False)["_temp_sort"].idxmin()
-            )
-
-        result_df = df_all_df.loc[idx].copy()
-        result_df = result_df.drop(columns=["_temp_sort"])  # limpia helper
+    print(f"DEBUG 🔍 Registros originales: df_initial={len(df_initial_df)}, df_to_merge={len(df_to_merge_df)}", flush=True)
+    
+    # Detectar duplicados internos
+    initial_internal_dups = df_initial_df.duplicated(subset=id_fields_list).sum()
+    merge_internal_dups = df_to_merge_df.duplicated(subset=id_fields_list).sum()
+    
+    print(f"DEBUG 🔍 Duplicados internos detectados: df_initial={initial_internal_dups}, df_to_merge={merge_internal_dups}", flush=True)
+    
+    # Limpiar duplicados internos usando la misma política
+    if initial_internal_dups > 0:
+        print(f"CLEANING 🧹 Limpiando {initial_internal_dups} duplicados internos en df_initial", flush=True)
+        df_initial_clean = _clean_internal_duplicates(df_initial_df, id_fields_list, date_col_str, date_fmt_str, policy_str)
     else:
-        # Mantener orden de concatenación; "first" preserva df_initial_df
-        keep_flag = "first" if policy_str == "keep_df_initial" else "last"
-        result_df = (
-            df_all_df.drop_duplicates(subset=id_fields_list, keep=keep_flag)
-            .copy()
-        )
-
-    result_df.reset_index(drop=True, inplace=True)
+        df_initial_clean = df_initial_df.copy()
+    
+    if merge_internal_dups > 0:
+        print(f"CLEANING 🧹 Limpiando {merge_internal_dups} duplicados internos en df_to_merge", flush=True)
+        df_to_merge_clean = _clean_internal_duplicates(df_to_merge_df, id_fields_list, date_col_str, date_fmt_str, policy_str)
+    else:
+        df_to_merge_clean = df_to_merge_df.copy()
+    
+    print(f"DEBUG 🔍 Registros después de limpieza interna: df_initial={len(df_initial_clean)}, df_to_merge={len(df_to_merge_clean)}", flush=True)
+    
+    # Verificar que no quedan duplicados internos
+    final_initial_dups = df_initial_clean.duplicated(subset=id_fields_list).sum()
+    final_merge_dups = df_to_merge_clean.duplicated(subset=id_fields_list).sum()
+    
+    if final_initial_dups > 0 or final_merge_dups > 0:
+        print(f"[ERROR ❌] Aún quedan duplicados internos: df_initial={final_initial_dups}, df_to_merge={final_merge_dups}", flush=True)
 
     # ──────────────────────────
-    # 4️⃣ Alinear dtypes al esquema original
+    # 4️⃣ Limpiar espacios en id_fields
+    # ──────────────────────────
+    for field in id_fields_list:
+        if df_initial_clean[field].dtype == 'object':
+            df_initial_clean[field] = df_initial_clean[field].astype(str).str.strip()
+        if df_to_merge_clean[field].dtype == 'object':
+            df_to_merge_clean[field] = df_to_merge_clean[field].astype(str).str.strip()
+
+    # ──────────────────────────
+    # 5️⃣ Identificar registros para consolidación
+    # ──────────────────────────
+    
+    # Crear identificador único para cada registro
+    df_initial_clean['_temp_id'] = df_initial_clean[id_fields_list].apply(lambda x: '||'.join(x.astype(str)), axis=1)
+    df_to_merge_clean['_temp_id'] = df_to_merge_clean[id_fields_list].apply(lambda x: '||'.join(x.astype(str)), axis=1)
+    
+    # Identificar qué registros están en ambos DataFrames
+    ids_initial = set(df_initial_clean['_temp_id'])
+    ids_to_merge = set(df_to_merge_clean['_temp_id'])
+    
+    common_ids = ids_initial.intersection(ids_to_merge)
+    only_initial = ids_initial - ids_to_merge
+    only_to_merge = ids_to_merge - ids_initial
+    
+    print(f"DEBUG 🔍 Análisis de intersección:", flush=True)
+    print(f"  - Solo en df_initial: {len(only_initial)}", flush=True)
+    print(f"  - Solo en df_to_merge: {len(only_to_merge)}", flush=True)
+    print(f"  - En ambos (requieren consolidación): {len(common_ids)}", flush=True)
+    
+    # ──────────────────────────
+    # 6️⃣ Separar registros según su situación
+    # ──────────────────────────
+    
+    # Registros únicos (no requieren consolidación)
+    unique_from_initial = df_initial_clean[df_initial_clean['_temp_id'].isin(only_initial)].copy()
+    unique_from_merge = df_to_merge_clean[df_to_merge_clean['_temp_id'].isin(only_to_merge)].copy()
+    
+    # Registros que requieren consolidación
+    conflicting_initial = df_initial_clean[df_initial_clean['_temp_id'].isin(common_ids)].copy()
+    conflicting_merge = df_to_merge_clean[df_to_merge_clean['_temp_id'].isin(common_ids)].copy()
+    
+    print(f"DEBUG 🔍 Distribución de registros:", flush=True)
+    print(f"  - Únicos de initial: {len(unique_from_initial)}", flush=True)
+    print(f"  - Únicos de merge: {len(unique_from_merge)}", flush=True)
+    print(f"  - Conflictivos de initial: {len(conflicting_initial)}", flush=True)
+    print(f"  - Conflictivos de merge: {len(conflicting_merge)}", flush=True)
+
+    # ──────────────────────────
+    # 7️⃣ Resolver conflictos
+    # ──────────────────────────
+    if len(common_ids) > 0:
+        print(f"RESOLVING 🔧 Aplicando política '{policy_str}' a {len(common_ids)} registros conflictivos", flush=True)
+        
+        # Combinar registros conflictivos para resolución
+        conflicting_all = pd.concat([conflicting_initial, conflicting_merge], ignore_index=True)
+        conflicting_all['_source'] = ['initial'] * len(conflicting_initial) + ['to_merge'] * len(conflicting_merge)
+        
+        resolved_conflicts = _resolve_conflicts(conflicting_all, id_fields_list, date_col_str, date_fmt_str, policy_str)
+        
+        print(f"DEBUG 🔍 Conflictos resueltos: {len(resolved_conflicts)} registros", flush=True)
+    else:
+        resolved_conflicts = pd.DataFrame(columns=df_initial_clean.columns)
+
+    # ──────────────────────────
+    # 8️⃣ Combinar resultado final
+    # ──────────────────────────
+    
+    # Limpiar columnas temporales
+    for df in [unique_from_initial, unique_from_merge, resolved_conflicts]:
+        if len(df) > 0:
+            df.drop(columns=['_temp_id'], errors='ignore', inplace=True)
+            df.drop(columns=['_source'], errors='ignore', inplace=True)
+    
+    # Combinar todos los registros
+    result_parts = []
+    if len(unique_from_initial) > 0:
+        result_parts.append(unique_from_initial)
+    if len(unique_from_merge) > 0:
+        result_parts.append(unique_from_merge)
+    if len(resolved_conflicts) > 0:
+        result_parts.append(resolved_conflicts)
+    
+    if result_parts:
+        result_df = pd.concat(result_parts, ignore_index=True)
+    else:
+        result_df = pd.DataFrame(columns=df_initial_df.columns)
+
+    # ──────────────────────────
+    # 9️⃣ Verificación final exhaustiva
+    # ──────────────────────────
+    result_df.reset_index(drop=True, inplace=True)
+    
+    # Verificar duplicados finales
+    final_duplicates_id = result_df.duplicated(subset=id_fields_list).sum()
+    final_duplicates_exact = result_df.duplicated().sum()
+    
+    print(f"VERIFICATION 🔍 Verificación final:", flush=True)
+    print(f"  - Registros finales: {len(result_df)}", flush=True)
+    print(f"  - Duplicados por id_fields: {final_duplicates_id}", flush=True)
+    print(f"  - Duplicados exactos: {final_duplicates_exact}", flush=True)
+    
+    if final_duplicates_id > 0:
+        print(f"[ERROR ❌] CRÍTICO: AÚN QUEDAN {final_duplicates_id} DUPLICADOS POR ID_FIELDS", flush=True)
+        # Mostrar ejemplos
+        dup_examples = result_df[result_df.duplicated(subset=id_fields_list, keep=False)][id_fields_list].head(10)
+        print(f"Ejemplos de duplicados:\n{dup_examples.to_string()}", flush=True)
+
+    # ──────────────────────────
+    # 🔟 Alinear dtypes y metadatos finales
     # ──────────────────────────
     for col_str, dtype in df_initial_df.dtypes.items():
-        try:
-            result_df[col_str] = result_df[col_str].astype(dtype, copy=False)
-        except (ValueError, TypeError):
-            print(
-                f"[TYPE WARN ⚠️] No se pudo convertir '{col_str}' a {dtype}", flush=True
-            )
+        if col_str in result_df.columns:
+            try:
+                result_df[col_str] = result_df[col_str].astype(dtype, copy=False)
+            except (ValueError, TypeError) as e:
+                print(f"[TYPE WARN ⚠️] No se pudo convertir '{col_str}' a {dtype}: {e}", flush=True)
 
-    # ──────────────────────────
-    # 5️⃣ Metadatos y salida
-    # ──────────────────────────
-    duplicates_resolved_int = duplicates_before_int - len(result_df)
-    print(
-        f"FINISHED ✅ registros finales={len(result_df)} | duplicados_resueltos={duplicates_resolved_int}",
-        flush=True,
-    )
+    total_original = len(df_initial_df) + len(df_to_merge_df)
+    duplicates_resolved = total_original - len(result_df)
+    
+    print(f"FINISHED ✅ consolidación completada:", flush=True)
+    print(f"  - Registros originales totales: {total_original}", flush=True)
+    print(f"  - Registros finales: {len(result_df)}", flush=True)
+    print(f"  - Duplicados eliminados: {duplicates_resolved}", flush=True)
+    print(f"  - Registros agregados al df_initial: {len(result_df) - len(df_initial_df)}", flush=True)
 
     if return_meta_bool:
         metadata_dic: dict = {
             "timestamp": datetime.now(),
             "initial_records": len(df_initial_df),
             "merge_records": len(df_to_merge_df),
+            "initial_internal_duplicates": initial_internal_dups,
+            "merge_internal_duplicates": merge_internal_dups,
+            "records_only_initial": len(only_initial),
+            "records_only_merge": len(only_to_merge),
+            "records_in_both": len(common_ids),
             "final_records": len(result_df),
-            "duplicates_resolved": duplicates_resolved_int,
+            "total_duplicates_resolved": duplicates_resolved,
             "records_added": len(result_df) - len(df_initial_df),
+            "final_duplicates_by_id": final_duplicates_id,
+            "final_duplicates_exact": final_duplicates_exact,
         }
         return result_df, metadata_dic
 
     return result_df
+
+
+def _clean_internal_duplicates(df, id_fields, date_col, date_fmt, policy):
+    """Función auxiliar para limpiar duplicados internos en un DataFrame."""
+    import pandas as pd
+    
+    if policy in ("keep_newest", "keep_oldest"):
+        # Convertir fechas
+        df_temp = df.copy()
+        df_temp[f'{date_col}_parsed'] = pd.to_datetime(df_temp[date_col], format=date_fmt, errors="coerce")
+        
+        if policy == "keep_newest":
+            df_temp['_sort_date'] = df_temp[f'{date_col}_parsed'].fillna(pd.Timestamp('1900-01-01'))
+            df_cleaned = df_temp.sort_values('_sort_date', ascending=False).drop_duplicates(subset=id_fields, keep='first')
+        else:  # keep_oldest
+            df_temp['_sort_date'] = df_temp[f'{date_col}_parsed'].fillna(pd.Timestamp('2099-12-31'))
+            df_cleaned = df_temp.sort_values('_sort_date', ascending=True).drop_duplicates(subset=id_fields, keep='first')
+        
+        # Limpiar columnas temporales
+        df_cleaned = df_cleaned.drop(columns=[f'{date_col}_parsed', '_sort_date'], errors='ignore')
+    else:
+        # Para keep_df_initial o keep_df_to_merge, mantener el primero
+        df_cleaned = df.drop_duplicates(subset=id_fields, keep='first')
+    
+    return df_cleaned
+
+
+def _resolve_conflicts(df_conflicts, id_fields, date_col, date_fmt, policy):
+    """Función auxiliar para resolver conflictos entre DataFrames."""
+    import pandas as pd
+    
+    if policy == "keep_newest":
+        df_conflicts[f'{date_col}_parsed'] = pd.to_datetime(df_conflicts[date_col], format=date_fmt, errors="coerce")
+        df_conflicts['_sort_date'] = df_conflicts[f'{date_col}_parsed'].fillna(pd.Timestamp('1900-01-01'))
+        df_conflicts['_sort_source'] = (df_conflicts['_source'] == 'to_merge').astype(int)
+        
+        df_sorted = df_conflicts.sort_values(['_sort_date', '_sort_source'], ascending=[False, True])
+        resolved = df_sorted.drop_duplicates(subset=id_fields, keep='first')
+        
+    elif policy == "keep_oldest":
+        df_conflicts[f'{date_col}_parsed'] = pd.to_datetime(df_conflicts[date_col], format=date_fmt, errors="coerce")
+        df_conflicts['_sort_date'] = df_conflicts[f'{date_col}_parsed'].fillna(pd.Timestamp('2099-12-31'))
+        df_conflicts['_sort_source'] = (df_conflicts['_source'] == 'to_merge').astype(int)
+        
+        df_sorted = df_conflicts.sort_values(['_sort_date', '_sort_source'], ascending=[True, True])
+        resolved = df_sorted.drop_duplicates(subset=id_fields, keep='first')
+        
+    elif policy == "keep_df_initial":
+        df_conflicts['_sort_source'] = (df_conflicts['_source'] == 'to_merge').astype(int)
+        df_sorted = df_conflicts.sort_values('_sort_source')
+        resolved = df_sorted.drop_duplicates(subset=id_fields, keep='first')
+        
+    elif policy == "keep_df_to_merge":
+        df_conflicts['_sort_source'] = (df_conflicts['_source'] == 'initial').astype(int)
+        df_sorted = df_conflicts.sort_values('_sort_source')
+        resolved = df_sorted.drop_duplicates(subset=id_fields, keep='first')
+    
+    # Limpiar columnas temporales
+    temp_cols = [col for col in resolved.columns if '_parsed' in col or '_sort_' in col]
+    resolved = resolved.drop(columns=temp_cols, errors='ignore')
+    
+    return resolved
 
 
 
