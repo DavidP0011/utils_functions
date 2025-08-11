@@ -782,39 +782,56 @@ def table_various_sources_to_DF(params: dict) -> pd.DataFrame:
 def table_DF_to_various_targets(params: dict) -> None:
     """
     Escribe un DataFrame en distintos destinos (archivo local, Google Sheets,
-    BigQuery o GCS) según la configuración definida en el diccionario de
-    entrada, permitiendo especificar el modo de escritura: sobrescribir
-    ('overwrite') o agregar ('append').
+    BigQuery o GCS) según la configuración definida en 'params'.
 
-    Args
-    ----
-      params (dict):
-        - df (pd.DataFrame): DataFrame a exportar.
-        - ini_environment_identificated (str): 'LOCAL', 'COLAB', 'COLAB_ENTERPRISE'
-          o el ID del proyecto GCP.
-        - Claves de autenticación (una de ellas según el entorno):
-            · json_keyfile_local
-            · json_keyfile_colab
-            · json_keyfile_GCP_secret_id
-        - Parámetros de destino (uno de los grupos):
-            · file_target_table_path, file_target_table_overwrite_or_append
-            · spreadsheet_target_table_id,
-              spreadsheet_target_table_worksheet_name,
-              spreadsheet_target_table_overwrite_or_append
-            · GBQ_target_table_name, GBQ_target_table_overwrite_or_append
-            · GCS_target_table_bucket_name, GCS_target_table_file_path,
-              GCS_target_table_overwrite_or_append
+    Parámetros (params)
+    -------------------
+    - df (pd.DataFrame): DataFrame a exportar. [OBLIGATORIO]
+    - ini_environment_identificated (str): 'LOCAL' | 'COLAB' | 'COLAB_ENTERPRISE' | 'GCP'
+      (indica el ENTORNO, NO el project_id).
+    - json_keyfile_local (str): Ruta a keyfile para LOCAL. (según entorno)
+    - json_keyfile_colab (str): Ruta a keyfile en Drive para COLAB. (según entorno)
+    - json_keyfile_GCP_secret_id (str): ID de Secret Manager o config GCE/GKE. (según entorno)
+
+    - gcp_project_id (str): ID real del proyecto GCP. [RECOMENDADO]
+      Si no se pasa, se intenta inferir desde:
+        1) GBQ_target_table_name (si viene como project.dataset.table)
+        2) Variable de entorno GOOGLE_CLOUD_PROJECT
+        3) ini_environment_identificated sólo si NO es un valor reservado (LOCAL/COLAB/...)
+
+    Destinos (elige uno):
+    - Archivo local:
+        file_target_table_path (str)
+        file_target_table_overwrite_or_append (str): 'overwrite' | 'append'
+    - Google Sheets:
+        spreadsheet_target_table_id (str o URL)
+        spreadsheet_target_table_worksheet_name (str)
+        spreadsheet_target_table_overwrite_or_append (str): 'overwrite' | 'append'
+    - BigQuery:
+        GBQ_target_table_name (str): '[project.]dataset.table'
+        GBQ_target_table_overwrite_or_append (str): 'overwrite' | 'append'
+        GBQ_location_str (str): ubicación del dataset (p.ej. 'EU'). [opcional]
+        GBQ_create_dataset_if_not_exists_bool (bool): default True
+    - Google Cloud Storage:
+        GCS_target_table_bucket_name (str)
+        GCS_target_table_file_path (str)
+        GCS_target_table_overwrite_or_append (str): 'overwrite' | 'append'
+
+    Retorno
+    -------
+    - None
 
     Raises
     ------
-      ValueError  : Si faltan parámetros obligatorios o son inválidos.
-      RuntimeError: Si ocurre un error durante la escritura.
+    - ValueError: Si faltan parámetros obligatorios o inválidos.
+    - RuntimeError: Si ocurre un error durante la escritura.
     """
     # ─────────────────────────────── IMPORTS BÁSICOS ────────────────────────────────
-    import os, io, math
+    import os, io, time, random
     import pandas as pd, numpy as np
     from google.cloud import bigquery
     from google.oauth2.service_account import Credentials
+    from google.api_core.exceptions import NotFound, ServiceUnavailable
 
     # ──────────────────────────────── VALIDACIONES ────────────────────────────────
     print("\n🔹🔹🔹 [START ▶️] Iniciando escritura de DataFrame en destino configurado 🔹🔹🔹\n", flush=True)
@@ -829,14 +846,62 @@ def table_DF_to_various_targets(params: dict) -> None:
 
     # ────────────────────────── DETECCIÓN DEL DESTINO ──────────────────────────
     _es_target_archivo = lambda p: bool(p.get('file_target_table_path', '').strip())
-    _es_target_gsheet  = lambda p: not _es_target_archivo(p) and \
+    _es_target_gsheet  = lambda p: (not _es_target_archivo(p)) and \
                                    bool(p.get('spreadsheet_target_table_id', '').strip()) and \
                                    bool(p.get('spreadsheet_target_table_worksheet_name', '').strip())
     _es_target_gbq     = lambda p: bool(p.get('GBQ_target_table_name', '').strip())
     _es_target_gcs     = lambda p: bool(p.get('GCS_target_table_bucket_name', '').strip()) and \
                                    bool(p.get('GCS_target_table_file_path', '').strip())
 
-    # ──────────────────────────── SUB-FUNCIONES DE ESCRITURA ────────────────────────────
+    # ──────────────────────────── HELPERS INTERNOS ─────────────────────────────
+    def _resolve_project_id_str(p: dict) -> str:
+        project_override_str = (p.get("gcp_project_id") or "").strip()
+        if project_override_str:
+            return project_override_str
+        table_str = (p.get("GBQ_target_table_name") or "").strip()
+        if table_str.count(".") == 2:
+            return table_str.split(".")[0]
+        env_val = (p.get("ini_environment_identificated") or "").strip()
+        reserved_env = {"LOCAL", "COLAB", "COLAB_ENTERPRISE", "GCP"}
+        if env_val and env_val not in reserved_env:
+            return env_val
+        env_var = (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
+        if env_var:
+            return env_var
+        raise ValueError("[VALIDATION [ERROR ❌]] No se pudo determinar 'gcp_project_id'. "
+                         "Pase 'gcp_project_id' o use una tabla 'project.dataset.table'.")
+
+    def _ini_authenticate_API(p: dict, project_id_str: str, scopes: list) -> Credentials:
+        """
+        Autenticación mínima basada en el entorno, devolviendo Credentials con scopes.
+        (Si ya tienes tu propio helper, puedes sustituir esta función por el tuyo.)
+        """
+        from google.oauth2.service_account import Credentials as SACreds
+        env = (p.get("ini_environment_identificated") or "").upper()
+        key_local = p.get("json_keyfile_local")
+        key_colab = p.get("json_keyfile_colab")
+        # Para GCP/CE usa ADC si no hay key explícita
+        key_gcp_secret = p.get("json_keyfile_GCP_secret_id")
+
+        # Prioridad: local/colab si existen → si no, ADC
+        key_candidate = None
+        if env == "LOCAL" and key_local:
+            key_candidate = key_local
+        elif env == "COLAB" and key_colab:
+            key_candidate = key_colab
+        elif env in {"GCP", "COLAB_ENTERPRISE"} and key_local:
+            # Permite forzar un keyfile incluso en GCP si lo pasas
+            key_candidate = key_local
+
+        if key_candidate and os.path.exists(key_candidate):
+            creds = SACreds.from_service_account_file(key_candidate, scopes=scopes)
+        else:
+            # Application Default Credentials (p.ej. VM con SA adjunta)
+            from google.auth import default as default_auth
+            creds, _ = default_auth(scopes=scopes)
+        return creds
+
+    # ──────────────────────────── SUB-FUNCIONES DE ESCRITURA ───────────────────
     def _escribir_archivo(p: dict, d: pd.DataFrame) -> None:
         import os
         print("\n[LOAD [START ▶️]] Iniciando escritura en archivo local…", flush=True)
@@ -868,10 +933,6 @@ def table_DF_to_various_targets(params: dict) -> None:
             raise RuntimeError(f"[LOAD [ERROR ❌]] Error al escribir en archivo local: {e}")
 
     def _escribir_google_sheet(p: dict, d: pd.DataFrame) -> None:
-        """
-        Envía el DataFrame a Google Sheets respetando los formatos de fecha-hora
-        españoles (coma decimal). Se sobrescribe o añade según `mode`.
-        """
         import re
         from googleapiclient.discovery import build
         print("\n[LOAD [START ▶️]] Iniciando escritura en Google Sheets…", flush=True)
@@ -888,29 +949,19 @@ def table_DF_to_various_targets(params: dict) -> None:
 
         scopes = ["https://www.googleapis.com/auth/spreadsheets",
                   "https://www.googleapis.com/auth/drive"]
-        env = p.get("ini_environment_identificated")
-        project = os.getenv("GOOGLE_CLOUD_PROJECT") if env == "COLAB_ENTERPRISE" else env
-        creds   = _ini_authenticate_API(params, project).with_scopes(scopes)
+        project_id_str = _resolve_project_id_str(p)  # sólo para logs/consistencia
+        creds = _ini_authenticate_API(p, project_id_str, scopes=scopes)
         service = build('sheets', 'v4', credentials=creds)
 
-        # ── NUEVO: convertir columnas datetime a texto con coma decimal ──────────
+        # Convertir datetime a texto con coma decimal
         datetime_cols = d.select_dtypes(include=["datetime64[ns]", "datetime64[ns, utc]"]).columns
         if len(datetime_cols) > 0:
-            d = d.copy()  # evitamos SettingWithCopyWarning
+            d = d.copy()
             for col in datetime_cols:
-                # Ej.: 2021-02-09 08:52:29,217577  (coma decimal)
                 d[col] = d[col].dt.strftime("%Y-%m-%d %H:%M:%S,%f")
-        # ─────────────────────────────────────────────────────────────────────────
 
-        # ── Conversión de cada celda ────────────────────────────────────────────
         from decimal import Decimal, InvalidOperation
         def _cast(value):
-            """
-            Devuelve un número nativo, None o str.
-            - Timestamps ya vienen formateados como str con coma.
-            - Si prefieres coma decimal en todos los floats, cambia aquí `float(value)`
-              por `str(value).replace('.', ',')`.
-            """
             if pd.isna(value):
                 return None
             if isinstance(value, (float, np.floating, Decimal)):
@@ -956,23 +1007,59 @@ def table_DF_to_various_targets(params: dict) -> None:
         if not table:
             raise ValueError("[VALIDATION [ERROR ❌]] Falta 'GBQ_target_table_name'.")
 
-        env = p.get("ini_environment_identificated")
-        project = os.getenv("GOOGLE_CLOUD_PROJECT") if env == "COLAB_ENTERPRISE" else env
-        creds = _ini_authenticate_API(params, project).with_scopes(
-            ["https://www.googleapis.com/auth/bigquery",
-             "https://www.googleapis.com/auth/drive"])
-        client = bigquery.Client(credentials=creds, project=project)
+        # Resolver project_id correctamente
+        project_id_str = _resolve_project_id_str(p)
+        location_str = (p.get("GBQ_location_str") or "EU").strip()
+        scopes_bq = ["https://www.googleapis.com/auth/bigquery",
+                    "https://www.googleapis.com/auth/drive"]
+        creds = _ini_authenticate_API(p, project_id_str, scopes=scopes_bq)
+        client = bigquery.Client(credentials=creds, project=project_id_str, location=location_str)
+
+        # Autocreación de dataset si procede
+        create_dataset = p.get("GBQ_create_dataset_if_not_exists_bool", True)
+        try:
+            parts = table.split(".")
+            if len(parts) == 3:
+                dataset_id = f"{parts[0]}.{parts[1]}"
+            elif len(parts) == 2:
+                dataset_id = f"{project_id_str}.{parts[0]}"
+                table = f"{project_id_str}.{table}"
+            else:
+                raise ValueError("[VALIDATION [ERROR ❌]] Formato de 'GBQ_target_table_name' inválido. Use dataset.table o project.dataset.table.")
+
+            if create_dataset:
+                try:
+                    client.get_dataset(dataset_id)
+                except NotFound:
+                    from google.cloud.bigquery import Dataset
+                    ds = Dataset(dataset_id)
+                    ds.location = location_str
+                    client.create_dataset(ds, exists_ok=True)
+                    print(f"[EXTRACTION [INFO ℹ️]] Dataset creado: {dataset_id}", flush=True)
+        except Exception as e:
+            raise RuntimeError(f"[LOAD [ERROR ❌]] Error preparando dataset/tabla: {e}")
 
         job_cfg = LoadJobConfig(
             write_disposition=(WriteDisposition.WRITE_TRUNCATE if mode == "overwrite"
                                else WriteDisposition.WRITE_APPEND)
         )
-        try:
-            client.load_table_from_dataframe(d, table, job_config=job_cfg).result()
-            print("[LOAD [SUCCESS ✅]] DataFrame cargado exitosamente en BigQuery.", flush=True)
-            print(f"[METRICS [INFO ℹ️]] Destino final: https://console.cloud.google.com/bigquery?project={project}&ws=!1m5!1m4!4m3!1s{table}", flush=True)
-        except Exception as e:
-            raise RuntimeError(f"[LOAD [ERROR ❌]] Error al escribir en BigQuery: {e}")
+
+        # Reintentos básicos para 503
+        max_tries = 4
+        for attempt in range(1, max_tries + 1):
+            try:
+                client.load_table_from_dataframe(d, table, job_config=job_cfg).result()
+                print("[LOAD [SUCCESS ✅]] DataFrame cargado exitosamente en BigQuery.", flush=True)
+                print(f"[METRICS [INFO ℹ️]] Destino final: https://console.cloud.google.com/bigquery?project={project_id_str}", flush=True)
+                break
+            except ServiceUnavailable as e:
+                if attempt == max_tries:
+                    raise RuntimeError(f"[LOAD [ERROR ❌]] Error al escribir en BigQuery tras {max_tries} intentos: {e}")
+                sleep_secs = (2 ** attempt) + random.uniform(0, 1.5)
+                print(f"[LOAD [WARNING ⚠️]] 503 recibido. Reintentando en {sleep_secs:.1f}s (intento {attempt}/{max_tries})…", flush=True)
+                time.sleep(sleep_secs)
+            except Exception as e:
+                raise RuntimeError(f"[LOAD [ERROR ❌]] Error al escribir en BigQuery: {e}")
 
     def _escribir_gcs(p: dict, d: pd.DataFrame) -> None:
         from google.cloud import storage
@@ -984,12 +1071,12 @@ def table_DF_to_various_targets(params: dict) -> None:
             raise ValueError("[VALIDATION [ERROR ❌]] Faltan 'GCS_target_table_bucket_name' o 'GCS_target_table_file_path'.")
 
         mode = p.get("GCS_target_table_overwrite_or_append", "overwrite").lower()
-        env  = p.get("ini_environment_identificated")
-        project = os.getenv("GOOGLE_CLOUD_PROJECT") if env == "COLAB_ENTERPRISE" else env
-        creds   = _ini_authenticate_API(params, project).with_scopes(
-            ["https://www.googleapis.com/auth/devstorage.read_write"])
-        client  = storage.Client(credentials=creds, project=project)
+        project_id_str = _resolve_project_id_str(p)
+        scopes_gcs = ["https://www.googleapis.com/auth/devstorage.read_write"]
+        creds = _ini_authenticate_API(p, project_id_str, scopes=scopes_gcs)
+        client  = storage.Client(credentials=creds, project=project_id_str)
         blob    = client.bucket(bucket).blob(path)
+        import os
         _, ext  = os.path.splitext(path); ext = ext.lower()
 
         try:
@@ -1019,7 +1106,7 @@ def table_DF_to_various_targets(params: dict) -> None:
                 raise RuntimeError(f"Extensión '{ext}' no soportada para GCS.")
 
             print("[LOAD [SUCCESS ✅]] Archivo subido exitosamente a GCS.", flush=True)
-            print(f"[METRICS [INFO ℹ️]] Destino final: https://console.cloud.google.com/storage/browser/{bucket}?project={project}", flush=True)
+            print(f"[METRICS [INFO ℹ️]] Destino final: gs://{bucket}/{path}", flush=True)
         except Exception as e:
             raise RuntimeError(f"[LOAD [ERROR ❌]] Error al escribir en GCS: {e}")
 
@@ -1046,3 +1133,4 @@ def table_DF_to_various_targets(params: dict) -> None:
         raise
 
     print("\n🔹🔹🔹 [END [FINISHED ✅]] Escritura completada exitosamente. 🔹🔹🔹\n", flush=True)
+
